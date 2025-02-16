@@ -14,11 +14,10 @@ type App struct {
 }
 
 type DNSProxy struct {
-	Host            DNSProxyServer `yaml:"host"`
-	Upstream        DNSProxyServer `yaml:"upstream"`
-	DisableRemap53  bool           `yaml:"disableRemap53"`
-	DisableFakePTR  bool           `yaml:"disableFakePTR"`
-	DisableDropAAAA bool           `yaml:"disableDropAAAA"`
+	Host           DNSProxyServer `yaml:"host"`
+	Upstream       DNSProxyServer `yaml:"upstream"`
+	DisableRemap53 bool           `yaml:"disableRemap53"`
+	DisableFakePTR bool           `yaml:"disableFakePTR"`
 }
 
 type DNSProxyServer struct {

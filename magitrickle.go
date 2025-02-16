@@ -30,11 +30,10 @@ var (
 
 var DefaultAppConfig = models.App{
 	DNSProxy: models.DNSProxy{
-		Host:            models.DNSProxyServer{Address: "[::]", Port: 3553},
-		Upstream:        models.DNSProxyServer{Address: "127.0.0.1", Port: 53},
-		DisableRemap53:  false,
-		DisableFakePTR:  false,
-		DisableDropAAAA: false,
+		Host:           models.DNSProxyServer{Address: "[::]", Port: 3553},
+		Upstream:       models.DNSProxyServer{Address: "127.0.0.1", Port: 53},
+		DisableRemap53: false,
+		DisableFakePTR: false,
 	},
 	Netfilter: models.Netfilter{
 		IPTables: models.IPTables{
@@ -53,15 +52,13 @@ type App struct {
 	config            models.App
 	unprocessedGroups []models.Group
 
-	dnsMITM   *dnsMitmProxy.DNSMITMProxy
-	nfHelper4 *netfilterHelper.NetfilterHelper
-	nfHelper6 *netfilterHelper.NetfilterHelper
-	records   *records.Records
-	groups    []*group.Group
+	dnsMITM  *dnsMitmProxy.DNSMITMProxy
+	nfHelper *netfilterHelper.NetfilterHelper
+	records  *records.Records
+	groups   []*group.Group
 
-	isRunning     bool
-	dnsOverrider4 *netfilterHelper.PortRemap
-	dnsOverrider6 *netfilterHelper.PortRemap
+	isRunning    bool
+	dnsOverrider *netfilterHelper.PortRemap
 }
 
 func (a *App) handleLink(event netlink.LinkUpdate) {
@@ -125,45 +122,20 @@ func (a *App) start(ctx context.Context) (err error) {
 		},
 		ResponseHook: func(clientAddr net.Addr, reqMsg dns.Msg, respMsg dns.Msg, network string) (*dns.Msg, error) {
 			defer a.handleMessage(respMsg, clientAddr, &network)
-
-			if a.config.DNSProxy.DisableDropAAAA {
-				return nil, nil
-			}
-
-			var idx int
-			for _, answer := range respMsg.Answer {
-				if answer.Header().Rrtype == dns.TypeAAAA {
-					continue
-				}
-				respMsg.Answer[idx] = answer
-				idx++
-			}
-			respMsg.Answer = respMsg.Answer[:idx]
-
-			return &respMsg, nil
+			return nil, nil
 		},
 	}
 	a.records = records.New()
 
-	nh4, err := netfilterHelper.New(false)
+	a.nfHelper, err = netfilterHelper.New(a.config.Netfilter.IPTables.ChainPrefix)
 	if err != nil {
 		return fmt.Errorf("netfilter helper init fail: %w", err)
 	}
-	err = nh4.CleanIPTables(a.config.Netfilter.IPTables.ChainPrefix)
-	if err != nil {
-		return fmt.Errorf("failed to clear iptables: %w", err)
-	}
-	a.nfHelper4 = nh4
 
-	nh6, err := netfilterHelper.New(true)
-	if err != nil {
-		return fmt.Errorf("netfilter helper init fail: %w", err)
-	}
-	err = nh6.CleanIPTables(a.config.Netfilter.IPTables.ChainPrefix)
+	err = a.nfHelper.CleanIPTables()
 	if err != nil {
 		return fmt.Errorf("failed to clear iptables: %w", err)
 	}
-	a.nfHelper6 = nh6
 
 	newCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -214,19 +186,12 @@ func (a *App) start(ctx context.Context) (err error) {
 	}
 
 	if !a.config.DNSProxy.DisableRemap53 {
-		a.dnsOverrider4 = a.nfHelper4.PortRemap(fmt.Sprintf("%sDNSOR", a.config.Netfilter.IPTables.ChainPrefix), 53, a.config.DNSProxy.Host.Port, addrList)
-		err = a.dnsOverrider4.Enable()
+		a.dnsOverrider = a.nfHelper.PortRemap("DNSOR", 53, a.config.DNSProxy.Host.Port, addrList)
+		err = a.dnsOverrider.Enable()
 		if err != nil {
-			return fmt.Errorf("failed to override DNS (IPv4): %v", err)
+			return fmt.Errorf("failed to override DNS: %v", err)
 		}
-		defer func() { _ = a.dnsOverrider4.Disable() }()
-
-		a.dnsOverrider6 = a.nfHelper6.PortRemap(fmt.Sprintf("%sDNSOR", a.config.Netfilter.IPTables.ChainPrefix), 53, a.config.DNSProxy.Host.Port, addrList)
-		err = a.dnsOverrider6.Enable()
-		if err != nil {
-			return fmt.Errorf("failed to override DNS (IPv6): %v", err)
-		}
-		defer func() { _ = a.dnsOverrider6.Disable() }()
+		defer func() { _ = a.dnsOverrider.Disable() }()
 	}
 
 	/*
@@ -293,17 +258,13 @@ func (a *App) start(ctx context.Context) (err error) {
 
 				args := strings.Split(string(buf[:n]), ":")
 				if len(args) == 3 && args[0] == "netfilter.d" {
-					log.Debug().Str("table", args[2]).Msg("netfilter.d event")
-					err = a.dnsOverrider4.NetfilterDHook(args[2])
-					if err != nil {
-						log.Error().Err(err).Msg("error while fixing iptables after netfilter.d")
-					}
-					err = a.dnsOverrider6.NetfilterDHook(args[2])
+					log.Debug().Str("type", args[1]).Str("table", args[2]).Msg("netfilter.d event")
+					err = a.dnsOverrider.NetfilterDHook(args[1], args[2])
 					if err != nil {
 						log.Error().Err(err).Msg("error while fixing iptables after netfilter.d")
 					}
 					for _, group := range a.groups {
-						err := group.NetfilterDHook(args[2])
+						err := group.NetfilterDHook(args[1], args[2])
 						if err != nil {
 							log.Error().Err(err).Msg("error while fixing iptables after netfilter.d")
 						}
@@ -378,7 +339,7 @@ func (a *App) AddGroup(groupModel models.Group) error {
 		dup[rule.ID] = struct{}{}
 	}
 
-	grp, err := group.NewGroup(groupModel, a.nfHelper4, a.config.Netfilter.IPTables.ChainPrefix, a.config.Netfilter.IPSet.TablePrefix)
+	grp, err := group.NewGroup(groupModel, a.nfHelper, a.config.Netfilter.IPSet.TablePrefix)
 	if err != nil {
 		return fmt.Errorf("failed to create group: %w", err)
 	}
@@ -462,6 +423,57 @@ func (a *App) processARecord(aRecord dns.A, clientAddr net.Addr, network *string
 	}
 }
 
+func (a *App) processAAAARecord(aRecord dns.AAAA, clientAddr net.Addr, network *string) {
+	var clientAddrStr, networkStr string
+	if clientAddr != nil {
+		clientAddrStr = clientAddr.String()
+	}
+	if network != nil {
+		networkStr = *network
+	}
+	log.Trace().
+		Str("name", aRecord.Hdr.Name).
+		Str("address", aRecord.AAAA.String()).
+		Int("ttl", int(aRecord.Hdr.Ttl)).
+		Str("clientAddr", clientAddrStr).
+		Str("network", networkStr).
+		Msg("processing aaaa record")
+
+	ttlDuration := aRecord.Hdr.Ttl + a.config.Netfilter.IPSet.AdditionalTTL
+
+	a.records.AddARecord(aRecord.Hdr.Name[:len(aRecord.Hdr.Name)-1], aRecord.AAAA, ttlDuration)
+
+	names := a.records.GetAliases(aRecord.Hdr.Name[:len(aRecord.Hdr.Name)-1])
+	for _, group := range a.groups {
+	Rule:
+		for _, domain := range group.Rules {
+			if !domain.IsEnabled() {
+				continue
+			}
+			for _, name := range names {
+				if !domain.IsMatch(name) {
+					continue
+				}
+				// TODO: Check already existed
+				err := group.AddIP(aRecord.AAAA, ttlDuration)
+				if err != nil {
+					log.Error().
+						Str("address", aRecord.AAAA.String()).
+						Err(err).
+						Msg("failed to add address")
+				} else {
+					log.Debug().
+						Str("address", aRecord.AAAA.String()).
+						Str("aaaaRecordDomain", aRecord.Hdr.Name).
+						Str("cNameDomain", name).
+						Msg("add address")
+				}
+				break Rule
+			}
+		}
+	}
+}
+
 func (a *App) processCNameRecord(cNameRecord dns.CNAME, clientAddr net.Addr, network *string) {
 	var clientAddrStr, networkStr string
 	if clientAddr != nil {
@@ -520,6 +532,8 @@ func (a *App) handleRecord(rr dns.RR, clientAddr net.Addr, network *string) {
 	switch v := rr.(type) {
 	case *dns.A:
 		a.processARecord(*v, clientAddr, network)
+	case *dns.AAAA:
+		a.processAAAARecord(*v, clientAddr, network)
 	case *dns.CNAME:
 		a.processCNameRecord(*v, clientAddr, network)
 	default:
@@ -551,7 +565,6 @@ func (a *App) ImportConfig(cfg models.Config) error {
 	}
 	a.config.DNSProxy.DisableRemap53 = cfg.App.DNSProxy.DisableRemap53
 	a.config.DNSProxy.DisableFakePTR = cfg.App.DNSProxy.DisableFakePTR
-	a.config.DNSProxy.DisableDropAAAA = cfg.App.DNSProxy.DisableDropAAAA
 	if cfg.App.Netfilter.IPTables.ChainPrefix != "" {
 		a.config.Netfilter.IPTables.ChainPrefix = cfg.App.Netfilter.IPTables.ChainPrefix
 	}
