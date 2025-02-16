@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 type IPSet struct {
@@ -13,11 +14,20 @@ type IPSet struct {
 }
 
 func (r *IPSet) AddIP(addr net.IP, timeout *uint32) error {
-	err := netlink.IpsetAdd(r.SetName, &netlink.IPSetEntry{
-		IP:      addr,
-		Timeout: timeout,
-		Replace: true,
-	})
+	var err error
+	if len(addr) == net.IPv4len {
+		err = netlink.IpsetAdd(r.SetName+"_4", &netlink.IPSetEntry{
+			IP:      addr,
+			Timeout: timeout,
+			Replace: true,
+		})
+	} else if len(addr) == net.IPv6len {
+		err = netlink.IpsetAdd(r.SetName+"_6", &netlink.IPSetEntry{
+			IP:      addr,
+			Timeout: timeout,
+			Replace: true,
+		})
+	}
 	if err != nil {
 		return fmt.Errorf("failed to add address: %w", err)
 	}
@@ -25,9 +35,16 @@ func (r *IPSet) AddIP(addr net.IP, timeout *uint32) error {
 }
 
 func (r *IPSet) DelIP(addr net.IP) error {
-	err := netlink.IpsetDel(r.SetName, &netlink.IPSetEntry{
-		IP: addr,
-	})
+	var err error
+	if len(addr) == net.IPv4len {
+		err = netlink.IpsetDel(r.SetName+"_4", &netlink.IPSetEntry{
+			IP: addr,
+		})
+	} else if len(addr) == net.IPv6len {
+		err = netlink.IpsetDel(r.SetName+"_6", &netlink.IPSetEntry{
+			IP: addr,
+		})
+	}
 	if err != nil {
 		return fmt.Errorf("failed to delete address: %w", err)
 	}
@@ -35,11 +52,18 @@ func (r *IPSet) DelIP(addr net.IP) error {
 }
 
 func (r *IPSet) ListIPs() (map[string]*uint32, error) {
-	list, err := netlink.IpsetList(r.SetName)
+	addresses := make(map[string]*uint32)
+	list, err := netlink.IpsetList(r.SetName + "_4")
 	if err != nil {
 		return nil, err
 	}
-	addresses := make(map[string]*uint32)
+	for _, entry := range list.Entries {
+		addresses[string(entry.IP)] = entry.Timeout
+	}
+	list, err = netlink.IpsetList(r.SetName + "_6")
+	if err != nil {
+		return nil, err
+	}
 	for _, entry := range list.Entries {
 		addresses[string(entry.IP)] = entry.Timeout
 	}
@@ -47,7 +71,11 @@ func (r *IPSet) ListIPs() (map[string]*uint32, error) {
 }
 
 func (r *IPSet) Destroy() error {
-	err := netlink.IpsetDestroy(r.SetName)
+	err := netlink.IpsetDestroy(r.SetName + "_4")
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to destroy ipset: %w", err)
+	}
+	err = netlink.IpsetDestroy(r.SetName + "_6")
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to destroy ipset: %w", err)
 	}
@@ -63,8 +91,17 @@ func (nh *NetfilterHelper) IPSet(name string) (*IPSet, error) {
 		return nil, err
 	}
 
-	err = netlink.IpsetCreate(ipset.SetName, "hash:net", netlink.IpsetCreateOptions{
+	err = netlink.IpsetCreate(ipset.SetName+"_4", "hash:net", netlink.IpsetCreateOptions{
 		Timeout: func(i uint32) *uint32 { return &i }(300),
+		Family:  unix.AF_INET,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create ipset: %w", err)
+	}
+
+	err = netlink.IpsetCreate(ipset.SetName+"_6", "hash:net", netlink.IpsetCreateOptions{
+		Timeout: func(i uint32) *uint32 { return &i }(300),
+		Family:  unix.AF_INET6,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create ipset: %w", err)
